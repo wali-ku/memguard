@@ -13,9 +13,13 @@
  **************************************************************************/
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+/* This enables ratio based throttling of regulated cores based on values
+ * supplied by user-space via memory-mapped IO. Comment out the following macro
+ * to disable this feature */
+#define MEMGUARD_GPU
+
 #define USE_RCFS   0
 #define USE_BWLOCK 0
-#define MEMGUARD_GPU
 
 #define DEBUG(x)
 #define DEBUG_RECLAIM(x)
@@ -159,6 +163,10 @@ static struct core_info __percpu *core_info;
 
 #ifdef MEMGUARD_GPU
 static struct mmap_char_device mmap_device;
+static struct user_info user_info = {
+	.enable = 0,
+	.budget_ratio = 100,
+};
 void *mmap_buffer = NULL;
 #endif
 
@@ -614,6 +622,10 @@ static void period_timer_callback_slave(void *info)
 	long new_period = (long)info;
 	int cpu = smp_processor_id();
 
+#ifdef MEMGUARD_GPU
+	struct user_info *uinfo = &user_info;
+#endif
+
 	/* must be irq disabled. hard irq */
 	BUG_ON(!irqs_disabled());
 	WARN_ON_ONCE(!in_irq());
@@ -669,8 +681,13 @@ static void period_timer_callback_slave(void *info)
 	/* new budget assignment from user */
 	if (cinfo->limit > 0) {
 		/* limit mode */
-		cinfo->budget = cinfo->limit;
-	} 
+#ifdef MEMGUARD_GPU
+		if (uinfo->enable == 1 && uinfo->budget_ratio != 0)
+			cinfo->budget = (cinfo->limit * uinfo->budget_ratio) / 100;
+		else
+#endif
+			cinfo->budget = cinfo->limit;
+	}
 
 	/* budget can't be zero? */
 	cinfo->budget = max(cinfo->budget, 1);
@@ -699,10 +716,13 @@ static void period_timer_callback_slave(void *info)
 enum hrtimer_restart period_timer_callback_master(struct hrtimer *timer)
 {
 	struct memguard_info *global = &memguard_info;
-
+	long new_period;
 	ktime_t now;
 	int orun;
-	long new_period;
+
+#ifdef MEMGUARD_GPU
+	struct user_info *uinfo = &user_info;
+#endif
 
 	now = timer->base->get_time();
 	global->cur_period_start = now;
@@ -722,6 +742,12 @@ enum hrtimer_restart period_timer_callback_master(struct hrtimer *timer)
 #if USE_BWLOCK
 	global->bwlocked_cores = mg_nr_bwlocked_cores();
 #endif
+
+#ifdef MEMGUARD_GPU
+	uinfo->enable = ((struct user_info *)mmap_buffer)->enable;
+	uinfo->budget_ratio = ((struct user_info *)mmap_buffer)->budget_ratio;
+#endif
+
 	memguard_on_each_cpu_mask(global->active_mask,
 		period_timer_callback_slave, (void *)new_period, 0);
 

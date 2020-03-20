@@ -23,7 +23,7 @@
 
 struct user_info {
 	int enable;
-	int budget;
+	int budget_ratio;
 };
 
 #define DEV_NAME			"memgpu"
