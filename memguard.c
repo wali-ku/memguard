@@ -13,6 +13,11 @@
  **************************************************************************/
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+/* This enables ratio based throttling of regulated cores based on values
+ * supplied by user-space via memory-mapped IO. Comment out the following macro
+ * to disable this feature */
+#define MEMGUARD_GPU
+
 #define USE_RCFS   0
 #define USE_BWLOCK 0
 
@@ -54,6 +59,12 @@
 #  include <linux/sched/rt.h>
 #endif
 #include <linux/sched.h>
+
+#ifdef MEMGUARD_GPU
+#include <linux/cdev.h>
+#include <linux/mm.h>
+#include "gpu_map.h"
+#endif
 
 /**************************************************************************
  * Public Definitions
@@ -135,12 +146,29 @@ struct memguard_info {
 	struct hrtimer hr_timer;
 };
 
+#ifdef MEMGUARD_GPU
+struct mmap_char_device {
+	int major_num;
+	dev_t first_char_dev;
+	struct cdev char_dev;
+	struct class *dev_class;
+};
+#endif
 
 /**************************************************************************
  * Global Variables
  **************************************************************************/
 static struct memguard_info memguard_info;
 static struct core_info __percpu *core_info;
+
+#ifdef MEMGUARD_GPU
+static struct mmap_char_device mmap_device;
+static struct user_info user_info = {
+	.enable = 0,
+	.budget_ratio = 100,
+};
+void *mmap_buffer = NULL;
+#endif
 
 static char *g_hw_type = "";
 static int g_period_us = 1000;
@@ -214,6 +242,48 @@ MODULE_PARM_DESC(g_period_us, "throttling period in usec");
 /**************************************************************************
  * Module main code
  **************************************************************************/
+#ifdef MEMGUARD_GPU
+static int device_open(struct inode *inode, struct file *filp)
+{
+	try_module_get(THIS_MODULE);
+	return 0;
+}
+
+static int device_release(struct inode *inode, struct file *filp)
+{
+	module_put(THIS_MODULE);
+	return 0;
+}
+
+static int device_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+	unsigned long page, pos;
+	unsigned long start = (unsigned long)vma->vm_start;
+	unsigned long size = (unsigned long)(vma->vm_end - vma->vm_start);
+
+	if (size > MMAP_BUF_SIZE) {
+		printk(KERN_ERR "mmap size exceeds limit=%d\n", MMAP_BUF_SIZE);
+		return -EINVAL;
+	}
+
+	pos = (unsigned long)mmap_buffer;
+	page = ((virt_to_phys((void *)pos)) >> PAGE_SHIFT);
+
+	if (remap_pfn_range(vma, start, page, size, PAGE_SHARED)) {
+		printk(KERN_ERR "Failed to remap the pages\n");
+		return -EAGAIN;
+	}
+
+	return 0;
+}
+
+static const struct file_operations cdev_control_fops = {
+	.mmap		= device_mmap,
+	.open 		= device_open,
+	.release	= device_release,
+};
+#endif /* MEMGUARD_GPU */
+
 /* similar to on_each_cpu_mask(), but this must be called with IRQ disabled */
 static void memguard_on_each_cpu_mask(const struct cpumask *mask, 
 				      smp_call_func_t func,
@@ -552,6 +622,10 @@ static void period_timer_callback_slave(void *info)
 	long new_period = (long)info;
 	int cpu = smp_processor_id();
 
+#ifdef MEMGUARD_GPU
+	struct user_info *uinfo = &user_info;
+#endif
+
 	/* must be irq disabled. hard irq */
 	BUG_ON(!irqs_disabled());
 	WARN_ON_ONCE(!in_irq());
@@ -607,8 +681,13 @@ static void period_timer_callback_slave(void *info)
 	/* new budget assignment from user */
 	if (cinfo->limit > 0) {
 		/* limit mode */
-		cinfo->budget = cinfo->limit;
-	} 
+#ifdef MEMGUARD_GPU
+		if (uinfo->enable == 1 && uinfo->budget_ratio != 0)
+			cinfo->budget = (cinfo->limit * uinfo->budget_ratio) / 100;
+		else
+#endif
+			cinfo->budget = cinfo->limit;
+	}
 
 	/* budget can't be zero? */
 	cinfo->budget = max(cinfo->budget, 1);
@@ -637,10 +716,13 @@ static void period_timer_callback_slave(void *info)
 enum hrtimer_restart period_timer_callback_master(struct hrtimer *timer)
 {
 	struct memguard_info *global = &memguard_info;
-
+	long new_period;
 	ktime_t now;
 	int orun;
-	long new_period;
+
+#ifdef MEMGUARD_GPU
+	struct user_info *uinfo = &user_info;
+#endif
 
 	now = timer->base->get_time();
 	global->cur_period_start = now;
@@ -660,6 +742,12 @@ enum hrtimer_restart period_timer_callback_master(struct hrtimer *timer)
 #if USE_BWLOCK
 	global->bwlocked_cores = mg_nr_bwlocked_cores();
 #endif
+
+#ifdef MEMGUARD_GPU
+	uinfo->enable = ((struct user_info *)mmap_buffer)->enable;
+	uinfo->budget_ratio = ((struct user_info *)mmap_buffer)->budget_ratio;
+#endif
+
 	memguard_on_each_cpu_mask(global->active_mask,
 		period_timer_callback_slave, (void *)new_period, 0);
 
@@ -1072,8 +1160,44 @@ static int throttle_thread(void *arg)
 int init_module( void )
 {
 	int i;
-
 	struct memguard_info *global = &memguard_info;
+
+#ifdef MEMGUARD_GPU
+	void *ret = NULL;
+	struct mmap_char_device  *mdev = &mmap_device;
+
+	mdev->major_num = alloc_chrdev_region(&mdev->first_char_dev, 0, 1,
+			DEV_NAME);
+	if (mdev->major_num < 0) {
+		printk(KERN_ERR "Failed to allocate character device\n");
+		goto err_ret;
+	}
+
+	mdev->dev_class = class_create(THIS_MODULE, DEV_NAME);
+	if (mdev->dev_class == NULL) {
+		printk(KERN_ERR "Character device class creation failed\n");
+		goto err_class;
+	}
+
+	ret = device_create(mdev->dev_class, NULL, mdev->first_char_dev, NULL,
+			DEV_NAME);
+	if (ret == NULL) {
+		printk(KERN_ERR "Character device creation failed\n");
+		goto err_dev;
+	}
+
+	cdev_init(&mdev->char_dev, &cdev_control_fops);
+	if (cdev_add(&mdev->char_dev, mdev->first_char_dev, 1) == -1) {
+		printk(KERN_ERR "Failed to init or add character device\n");
+		goto err_init;
+	}
+
+	mmap_buffer = (void *) get_zeroed_page(GFP_KERNEL);
+	if (mmap_buffer == NULL) {
+		printk(KERN_ERR "Failed to allocate buffer for mmap\n");
+		goto err_init;
+	}
+#endif /* MEMGUARD_GPU */
 
 	/* initialized memguard_info structure */
 	memset(global, 0, sizeof(struct memguard_info));
@@ -1190,19 +1314,37 @@ int init_module( void )
 		      HRTIMER_MODE_REL_PINNED);
 	put_cpu();
 
+
 #if USE_RCFS
 	/* register cpi function */
 	register_get_cpi(&get_cpi);
 #endif
 
 	return 0;
+
+#ifdef MEMGUARD_GPU
+err_init:
+	device_destroy(mdev->dev_class, mdev->first_char_dev);
+
+err_dev:
+	class_destroy(mdev->dev_class);
+
+err_class:
+	unregister_chrdev_region(mdev->first_char_dev, 1);
+
+err_ret:
+	return -EINVAL;
+#endif
 }
 
 void cleanup_module( void )
 {
 	int i;
-
 	struct memguard_info *global = &memguard_info;
+
+#ifdef MEMGUARD_GPU
+	struct mmap_char_device *mdev = &mmap_device;
+#endif
 
 #if USE_RCFS
 	/* unregister cpi function */
@@ -1241,6 +1383,14 @@ void cleanup_module( void )
 	free_cpumask_var(global->throttle_mask);
 	free_cpumask_var(global->active_mask);
 	free_percpu(core_info);
+
+#ifdef MEMGUARD_GPU
+	cdev_del(&mdev->char_dev);
+	device_destroy(mdev->dev_class, mdev->first_char_dev);
+	class_destroy(mdev->dev_class);
+	unregister_chrdev_region(mdev->first_char_dev, 1);
+	free_page((unsigned long)mmap_buffer);
+#endif
 
 	pr_info("module uninstalled successfully\n");
 	return;
