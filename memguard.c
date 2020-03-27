@@ -1294,8 +1294,8 @@ int init_module( void )
 
 		BUG_ON(IS_ERR(cinfo->throttle_thread));
 		kthread_bind(cinfo->throttle_thread, i);
-		wake_up_process(cinfo->throttle_thread);
 	}
+	put_online_cpus();
 
 	memguard_init_debugfs();
 
@@ -1304,6 +1304,25 @@ int init_module( void )
 
 	pr_info("Start period timer (period=%lld us)\n",
 		div64_u64(TM_NS(global->period_in_ktime), 1000));
+
+#ifdef MEMGUARD_GPU
+	/*
+	 * Synchronize with user-space by polling on a shared-memory flag.
+	 * NOTE: This is busy-wait loop i.e., the core on which "insmod" is
+	 * invoked will be non-responsive until this flag is set.
+	 */
+	while (1) {
+		if (((volatile struct user_info *)mmap_buffer)->enable)
+			break;
+	}
+#endif
+
+	get_online_cpus();
+	for_each_online_cpu(i) {
+		struct core_info *cinfo = per_cpu_ptr(core_info, i);
+		wake_up_process(cinfo->throttle_thread);
+	}
+	put_online_cpus();
 
 	get_cpu();
 	global->master = smp_processor_id();
